@@ -1,7 +1,10 @@
+import os
 import os.path as osp
+import json
 import numpy as np
 import torch
 from romatch.utils import *
+from romatch.utils.utils import get_tuple_transform_ops
 from PIL import Image
 from tqdm import tqdm
 
@@ -10,8 +13,15 @@ class ScanNetBenchmark:
     def __init__(self, data_root="data/scannet") -> None:
         self.data_root = data_root
 
-    def benchmark(self, model, model_name = None):
+    def benchmark(self, model, model_name=None, seed=0, dump_dir=None, max_pairs=None, output=None):
         model.train(False)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+
+        if dump_dir is not None:
+            os.makedirs(dump_dir, exist_ok=True)
+
         with torch.no_grad():
             data_root = self.data_root
             tmp = np.load(osp.join(data_root, "test.npz"))
@@ -20,7 +30,14 @@ class ScanNetBenchmark:
             pair_inds = np.random.choice(
                 range(len(pairs)), size=len(pairs), replace=False
             )
-            for pairind in tqdm(pair_inds, smoothing=0.9):
+            if max_pairs is not None:
+                pair_inds = pair_inds[:max_pairs]
+
+            device = next(model.parameters()).device
+            hs, ws = model.h_resized, model.w_resized
+            test_transform = get_tuple_transform_ops(resize=(hs, ws), normalize=True, clahe=False)
+
+            for dump_idx, pairind in enumerate(tqdm(pair_inds, smoothing=0.9)):
                 scene = pairs[pairind]
                 scene_name = f"scene0{scene[0]}_00"
                 im_A_path = osp.join(
@@ -63,10 +80,25 @@ class ScanNetBenchmark:
                 w2, h2 = im_B.size
                 K1 = K.copy()
                 K2 = K.copy()
-                dense_matches, dense_certainty = model.match(im_A_path, im_B_path)
+
+                im_A_t, im_B_t = test_transform((im_A.convert("RGB"), im_B.convert("RGB")))
+                dense_matches, dense_certainty = model.match(
+                    im_A_t[None].to(device), im_B_t[None].to(device)
+                )
                 sparse_matches, sparse_certainty = model.sample(
                     dense_matches, dense_certainty, 5000
                 )
+                sparse_matches_np = sparse_matches.cpu().numpy()
+
+                if dump_dir is not None:
+                    torch.save({
+                        'image0': im_A_t.cpu(),
+                        'image1': im_B_t.cpu(),
+                        'sparse_matches': sparse_matches.cpu(),
+                        'im0_path': im_A_path,
+                        'im1_path': im_B_path,
+                    }, osp.join(dump_dir, f'{dump_idx:05d}.pt'))
+
                 scale1 = 480 / min(w1, h1)
                 scale2 = 480 / min(w2, h2)
                 w1, h1 = scale1 * w1, scale1 * h1
@@ -75,7 +107,7 @@ class ScanNetBenchmark:
                 K2 = K2 * scale2
 
                 offset = 0.5
-                kpts1 = sparse_matches[:, :2]
+                kpts1 = sparse_matches_np[:, :2]
                 kpts1 = (
                     np.stack(
                         (
@@ -85,7 +117,7 @@ class ScanNetBenchmark:
                         axis=-1,
                     )
                 )
-                kpts2 = sparse_matches[:, 2:]
+                kpts2 = sparse_matches_np[:, 2:]
                 kpts2 = (
                     np.stack(
                         (
@@ -110,7 +142,7 @@ class ScanNetBenchmark:
                             norm_threshold,
                             conf=0.99999,
                         )
-                        T1_to_2_est = np.concatenate((R_est, t_est), axis=-1)  #
+                        T1_to_2_est = np.concatenate((R_est, t_est), axis=-1)
                         e_t, e_R = compute_pose_error(T1_to_2_est, R, t)
                         e_pose = max(e_t, e_R)
                     except Exception as e:
@@ -123,6 +155,7 @@ class ScanNetBenchmark:
                 tot_e_t.append(e_t)
                 tot_e_R.append(e_R)
                 tot_e_pose.append(e_pose)
+
             tot_e_pose = np.array(tot_e_pose)
             thresholds = [5, 10, 20]
             auc = pose_auc(tot_e_pose, thresholds)
@@ -133,7 +166,7 @@ class ScanNetBenchmark:
             map_5 = acc_5
             map_10 = np.mean([acc_5, acc_10])
             map_20 = np.mean([acc_5, acc_10, acc_15, acc_20])
-            return {
+            results = {
                 "auc_5": auc[0],
                 "auc_10": auc[1],
                 "auc_20": auc[2],
@@ -141,3 +174,10 @@ class ScanNetBenchmark:
                 "map_10": map_10,
                 "map_20": map_20,
             }
+
+            if output is not None:
+                os.makedirs(osp.dirname(osp.abspath(output)), exist_ok=True)
+                with open(output, 'w') as f:
+                    json.dump({k: float(v) for k, v in results.items()}, f, indent=2)
+
+            return results

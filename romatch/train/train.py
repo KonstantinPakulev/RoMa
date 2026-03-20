@@ -2,7 +2,10 @@ from tqdm import tqdm
 from romatch.utils.utils import to_cuda
 import romatch
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 def log_param_statistics(named_parameters, norm_type = 2):
     named_parameters = list(named_parameters)

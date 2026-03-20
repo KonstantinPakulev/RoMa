@@ -8,7 +8,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import json
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from tqdm import tqdm
 
 from romatch.benchmarks import MegadepthDenseBenchmark
@@ -161,9 +164,8 @@ def get_model(pretrained_backbone=True, resolution = "medium", **kwargs):
             pretrained=pretrained_backbone,
             amp = True),
         amp = True,
-        use_vgg = True,
     )
-    matcher = RegressionMatcher(encoder, decoder, h=h, w=w, alpha=1, beta=0,**kwargs)
+    matcher = RegressionMatcher(encoder, decoder, h=h, w=w, **kwargs)
     return matcher
 
 def train(args):
@@ -279,10 +281,12 @@ def train(args):
         checkpointer.save(model, optimizer, lr_scheduler, romatch.GLOBAL_STEP)
         wandb.log(megadense_benchmark.benchmark(model), step = romatch.GLOBAL_STEP)
 
-def test_scannet(model, name, resolution, sample_mode):
-    scannet_benchmark = ScanNetBenchmark("data/scannet")
-    scannet_results = scannet_benchmark.benchmark(model)
-    json.dump(scannet_results, open(f"results/scannet_{name}.json", "w"))
+def test_scannet(model, name, resolution, sample_mode, data_root="data/scannet",
+                 max_pairs=None, seed=0, output=None, dump_dir=None):
+    scannet_benchmark = ScanNetBenchmark(data_root)
+    scannet_results = scannet_benchmark.benchmark(model, seed=seed, dump_dir=dump_dir,
+                                                  max_pairs=max_pairs, output=output)
+    return scannet_results
 
 if __name__ == "__main__":
     import warnings
@@ -301,6 +305,13 @@ if __name__ == "__main__":
     parser.add_argument("--train_resolution", default='medium')
     parser.add_argument("--gpu_batch_size", default=4, type=int)
     parser.add_argument("--wandb_entity", required = False)
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to checkpoint .pth (default: workspace/<experiment>.pth)")
+    parser.add_argument("--data_root", default="data/scannet")
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--max_pairs", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dump_dir", default=None)
 
     args, _ = parser.parse_known_args()
     romatch.DEBUG_MODE = args.debug_mode
@@ -308,7 +319,7 @@ if __name__ == "__main__":
         train(args)
     experiment_name = os.path.splitext(os.path.basename(__file__))[0]
     checkpoint_dir = "workspace/"
-    checkpoint_name = checkpoint_dir + experiment_name + ".pth"
+    checkpoint_name = args.checkpoint if args.checkpoint else checkpoint_dir + experiment_name + ".pth"
     test_resolution = "medium"
     sample_mode = "threshold_balanced"
     symmetric = True
@@ -319,4 +330,6 @@ if __name__ == "__main__":
     model = model.cuda()
     states = torch.load(checkpoint_name)
     model.load_state_dict(states["model"])
-    test_scannet(model, experiment_name, resolution = test_resolution, sample_mode = sample_mode)
+    test_scannet(model, experiment_name, resolution=test_resolution, sample_mode=sample_mode,
+                 data_root=args.data_root, max_pairs=args.max_pairs, seed=args.seed,
+                 output=args.output, dump_dir=args.dump_dir)

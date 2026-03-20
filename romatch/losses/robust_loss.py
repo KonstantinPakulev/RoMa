@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from romatch.utils.utils import get_gt_warp
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import romatch
 import math
 
