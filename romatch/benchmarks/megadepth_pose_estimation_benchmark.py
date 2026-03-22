@@ -1,6 +1,8 @@
+import os
 import numpy as np
 import torch
 from romatch.utils import *
+from romatch.utils.utils import get_tuple_transform_ops
 from PIL import Image
 from tqdm import tqdm
 
@@ -22,13 +24,20 @@ class MegaDepthPoseEstimationBenchmark:
         ]
         self.data_root = data_root
 
-    def benchmark(self, model, model_name = None):
+    def benchmark(self, model, model_name=None, dump_dir=None, max_pairs=None):
+        if dump_dir is not None:
+            os.makedirs(dump_dir, exist_ok=True)
+            device = next(model.parameters()).device
+            dump_transform = get_tuple_transform_ops(
+                resize=(model.h_resized, model.w_resized), normalize=True, clahe=False
+            )
         with torch.no_grad():
             data_root = self.data_root
             tot_e_t, tot_e_R, tot_e_pose = [], [], []
             thresholds = [5, 10, 20]
+            dump_idx = 0
+            pair_count = 0
             for scene_ind in range(len(self.scenes)):
-                import os
                 scene_name = os.path.splitext(self.scene_names[scene_ind])[0]
                 scene = self.scenes[scene_ind]
                 pairs = scene["pair_infos"]
@@ -37,6 +46,9 @@ class MegaDepthPoseEstimationBenchmark:
                 im_paths = scene["image_paths"]
                 pair_inds = range(len(pairs))
                 for pairind in (pbar := tqdm(pair_inds, desc = "Current AUC: ?")):
+                    if max_pairs is not None and pair_count >= max_pairs:
+                        break
+                    pair_count += 1
                     idx1, idx2 = pairs[pairind][0]
                     K1 = intrinsics[idx1].copy()
                     T1 = poses[idx1].copy()
@@ -51,12 +63,12 @@ class MegaDepthPoseEstimationBenchmark:
                     dense_matches, dense_certainty = model.match(
                         im_A_path, im_B_path, K1.copy(), K2.copy(), T1_to_2.copy()
                     )
-                    
+
                     im_A = Image.open(im_A_path)
                     w1, h1 = im_A.size
                     im_B = Image.open(im_B_path)
                     w2, h2 = im_B.size
-                    if True: # Note: we keep this true as it was used in DKM/RoMa papers. There is very little difference compared to setting to False. 
+                    if True: # Note: we keep this true as it was used in DKM/RoMa papers. There is very little difference compared to setting to False.
                         scale1 = 1200 / max(w1, h1)
                         scale2 = 1200 / max(w2, h2)
                         w1, h1 = scale1 * w1, scale1 * h1
@@ -64,10 +76,28 @@ class MegaDepthPoseEstimationBenchmark:
                         K1, K2 = K1.copy(), K2.copy()
                         K1[:2] = K1[:2] * scale1
                         K2[:2] = K2[:2] * scale2
-                    for _ in range(5):
+                    for i in range(5):
+                        if i == 0 and dump_dir is not None:
+                            rng_cpu = torch.get_rng_state()
+                            rng_cuda = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
                         sparse_matches,_ = model.sample(
                             dense_matches, dense_certainty, 5_000
                         )
+                        if i == 0 and dump_dir is not None:
+                            im_A_t, im_B_t = dump_transform((
+                                Image.open(im_A_path).convert("RGB"),
+                                Image.open(im_B_path).convert("RGB"),
+                            ))
+                            torch.save({
+                                'image0': im_A_t.cpu(),
+                                'image1': im_B_t.cpu(),
+                                'sparse_matches': sparse_matches.cpu(),
+                                'im0_path': im_A_path,
+                                'im1_path': im_B_path,
+                                'rng_cpu': rng_cpu,
+                                'rng_cuda': rng_cuda,
+                            }, os.path.join(dump_dir, f'{dump_idx:05d}.pt'))
+                            dump_idx += 1
                         kpts1, kpts2 = model.to_pixel_coordinates(sparse_matches, h1, w1, h2, w2)
                         kpts1, kpts2 = kpts1.cpu().numpy(), kpts2.cpu().numpy()
                         shuffling = np.random.permutation(np.arange(len(kpts1)))
